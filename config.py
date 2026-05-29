@@ -19,7 +19,7 @@ from __future__ import annotations
 
 import os
 from dataclasses import dataclass, field
-from typing import Optional
+from typing import Any, Callable, Dict, Optional
 
 # Default directory for persistent files (history sqlite, vex .db).
 HOME_DIR = os.path.expanduser("~")
@@ -78,6 +78,27 @@ class VectorStoreConfig:
     hnsw_ef_construction: int = 200
 
 
+UsageCallback = Callable[[Dict[str, Any]], None]
+
+
+@dataclass
+class TechniqueFlags:
+    """Feature switches used by the ablation harness.
+
+    Defaults preserve LiteMem's normal behavior. These flags are intentionally
+    narrow and map to the experiment labels in ``litemem/exp.md``.
+    """
+
+    use_additive_extraction: bool = True
+    use_existing_memory_context: bool = True
+    use_recent_messages_context: bool = True
+    use_uuid_anonymization: bool = True
+    use_json_response_format: bool = True
+    use_bm25: bool = True
+    use_entity_boost: bool = True
+    use_hash_dedup: bool = True
+
+
 @dataclass
 class LiteMemConfig:
     """Top-level LiteMem configuration."""
@@ -92,6 +113,9 @@ class LiteMemConfig:
     recent_messages_limit: int = 10
     # Cap on existing memories retrieved during add() for the LLM to dedupe against.
     existing_memories_limit: int = 10
+    # Experiment-only knobs. Defaults keep the normal LiteMem behavior.
+    technique_flags: TechniqueFlags = field(default_factory=TechniqueFlags)
+    usage_callback: Optional[UsageCallback] = None
 
     def __post_init__(self):
         os.makedirs(LITEMEM_DIR, exist_ok=True)

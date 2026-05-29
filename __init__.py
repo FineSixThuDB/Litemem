@@ -9,6 +9,7 @@ from litemem.config import (
     LiteMemConfig,
     LLMConfig,
     MemoryConfig,
+    TechniqueFlags,
     VectorStoreConfig,
 )
 from litemem.data_models import MemoryItem, ScoredMemory, VectorRecord
@@ -21,6 +22,7 @@ __all__ = [
     "LLMConfig",
     "EmbedderConfig",
     "VectorStoreConfig",
+    "TechniqueFlags",
     "MemoryItem",
     "ScoredMemory",
     "VectorRecord",

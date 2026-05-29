@@ -11,7 +11,8 @@ from __future__ import annotations
 
 import logging
 import os
-from typing import List, Optional
+import time
+from typing import Any, Dict, List, Optional
 
 from litemem.config import EmbedderConfig
 from litemem.utils.auth import resolve_openai_api_key
@@ -40,6 +41,7 @@ class OpenAIEmbedder:
             ) from e
 
         self.config = config or EmbedderConfig()
+        self.usage_callback = None
         api_key = resolve_openai_api_key(self.config.api_key)
         base_url = (
             self.config.base_url
@@ -59,6 +61,45 @@ class OpenAIEmbedder:
         )
         self.client = OpenAI(api_key=api_key, base_url=base_url, timeout=self.config.timeout)
 
+    @staticmethod
+    def _usage_get(obj: Any, key: str, default: Any = None) -> Any:
+        if obj is None:
+            return default
+        if isinstance(obj, dict):
+            return obj.get(key, default)
+        return getattr(obj, key, default)
+
+    def _emit_usage(
+        self,
+        *,
+        stage: Optional[str],
+        usage: Any,
+        latency_s: float,
+        batch_size: int,
+        extra: Optional[Dict[str, Any]] = None,
+    ) -> None:
+        if self.usage_callback is None:
+            return
+        prompt_tokens = self._usage_get(usage, "prompt_tokens", 0) or 0
+        total_tokens = self._usage_get(usage, "total_tokens", prompt_tokens) or 0
+        event = {
+            "stage": stage or "embedding",
+            "kind": "embedding",
+            "model": self.config.model,
+            "latency_s": latency_s,
+            "chat_input_tokens": 0,
+            "chat_output_tokens": 0,
+            "cached_tokens": 0,
+            "reasoning_tokens": 0,
+            "embedding_tokens": int(total_tokens or 0),
+            "total_tokens": int(total_tokens or 0),
+            "usage_missing": usage is None,
+            "batch_size": int(batch_size),
+        }
+        if extra:
+            event["extra"] = extra
+        self.usage_callback(event)
+
     def _embed_request_kwargs(self, inputs: List[str]) -> dict:
         kwargs = {
             "model": self.config.model,
@@ -69,7 +110,13 @@ class OpenAIEmbedder:
             kwargs["dimensions"] = self.config.embedding_dims
         return kwargs
 
-    def embed(self, text: str, memory_action: Optional[str] = None) -> List[float]:
+    def embed(
+        self,
+        text: str,
+        memory_action: Optional[str] = None,
+        usage_stage: Optional[str] = None,
+        usage_extra: Optional[Dict[str, Any]] = None,
+    ) -> List[float]:
         """Embed one string.
 
         ``memory_action`` is accepted for API compatibility with mem0
@@ -78,6 +125,7 @@ class OpenAIEmbedder:
         """
         text = (text or "").replace("\n", " ")
         kwargs = self._embed_request_kwargs([text])
+        start = time.perf_counter()
         try:
             response = self.client.embeddings.create(**kwargs)
         except Exception as exc:
@@ -85,9 +133,23 @@ class OpenAIEmbedder:
                 raise
             kwargs.pop("dimensions", None)
             response = self.client.embeddings.create(**kwargs)
+        latency_s = time.perf_counter() - start
+        self._emit_usage(
+            stage=usage_stage,
+            usage=getattr(response, "usage", None),
+            latency_s=latency_s,
+            batch_size=1,
+            extra=usage_extra or {"memory_action": memory_action},
+        )
         return list(response.data[0].embedding)
 
-    def embed_batch(self, texts: List[str], memory_action: str = "add") -> List[List[float]]:
+    def embed_batch(
+        self,
+        texts: List[str],
+        memory_action: str = "add",
+        usage_stage: Optional[str] = None,
+        usage_extra: Optional[Dict[str, Any]] = None,
+    ) -> List[List[float]]:
         """Embed a list of strings, automatically chunking by ``batch_size``."""
         if not texts:
             return []
@@ -96,6 +158,7 @@ class OpenAIEmbedder:
         for i in range(0, len(cleaned), self.config.batch_size):
             chunk = cleaned[i: i + self.config.batch_size]
             kwargs = self._embed_request_kwargs(chunk)
+            start = time.perf_counter()
             try:
                 response = self.client.embeddings.create(**kwargs)
             except Exception as exc:
@@ -103,6 +166,14 @@ class OpenAIEmbedder:
                     raise
                 kwargs.pop("dimensions", None)
                 response = self.client.embeddings.create(**kwargs)
+            latency_s = time.perf_counter() - start
+            self._emit_usage(
+                stage=usage_stage,
+                usage=getattr(response, "usage", None),
+                latency_s=latency_s,
+                batch_size=len(chunk),
+                extra=usage_extra or {"memory_action": memory_action},
+            )
             # OpenAI guarantees ordering by .index, but defensively sort.
             ordered = sorted(response.data, key=lambda x: x.index)
             all_embeddings.extend(list(item.embedding) for item in ordered)

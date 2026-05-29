@@ -75,6 +75,8 @@ class MemoryExtractor:
         last_messages: List[Dict[str, Any]],
         filters: Dict[str, Any],
         prompt_override: Optional[str] = None,
+        use_uuid_anonymization: bool = True,
+        use_json_response_format: bool = True,
     ) -> ExtractionResult:
         """Run Phase 1 retrieval & Phase 2 LLM extraction.
 
@@ -96,8 +98,9 @@ class MemoryExtractor:
         anonymized = []
         uuid_mapping: Dict[str, str] = {}
         for idx, mem in enumerate(existing_memories):
-            uuid_mapping[str(idx)] = mem.id
-            anonymized.append({"id": str(idx), "text": mem.payload.get("data", "")})
+            prompt_id = str(idx) if use_uuid_anonymization else str(mem.id)
+            uuid_mapping[prompt_id] = mem.id
+            anonymized.append({"id": prompt_id, "text": mem.payload.get("data", "")})
 
         existing_hashes = {
             mem.payload.get("hash")
@@ -130,7 +133,14 @@ class MemoryExtractor:
                     {"role": "system", "content": system_prompt},
                     {"role": "user", "content": user_prompt},
                 ],
-                response_format={"type": "json_object"},
+                response_format={"type": "json_object"} if use_json_response_format else None,
+                usage_stage="add.memory_extraction",
+                usage_extra={
+                    "existing_memory_count": len(anonymized),
+                    "last_message_count": len(last_messages),
+                    "use_uuid_anonymization": use_uuid_anonymization,
+                    "use_json_response_format": use_json_response_format,
+                },
             )
         except Exception as e:
             logger.error(f"LLM extraction failed: {e}")

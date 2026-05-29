@@ -47,7 +47,10 @@ class ProceduralMemoryCreator:
             },
         ]
         try:
-            raw = self.llm.generate_response(messages=parsed)
+            raw = self.llm.generate_response(
+                messages=parsed,
+                usage_stage="add.procedural_memory_generation",
+            )
         except Exception as e:
             logger.error(f"Procedural memory generation failed: {e}")
             raise

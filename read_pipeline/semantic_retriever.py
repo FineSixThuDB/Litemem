@@ -30,8 +30,16 @@ class SemanticRetriever:
         filters: Optional[Dict[str, Any]] = None,
     ) -> List[VectorRecord]:
         internal_limit = max(top_k * 4, 60)
-        vec = self.embedder.embed(query, "search")
+        vec = self.embedder.embed(
+            query,
+            "search",
+            usage_stage="search.semantic_embedding",
+        )
         return self.vector_store.search(vec, top_k=internal_limit, filters=filters)
 
     def embed_query(self, query: str) -> List[float]:
-        return self.embedder.embed(query, "search")
+        return self.embedder.embed(
+            query,
+            "search",
+            usage_stage="search.semantic_embedding",
+        )

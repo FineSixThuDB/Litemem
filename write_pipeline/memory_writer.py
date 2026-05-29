@@ -67,13 +67,23 @@ class MemoryWriter:
         # Phase 3 — batch embed.
         texts = [f.text for f in facts]
         try:
-            vectors = self.embedder.embed_batch(texts, "add")
+            vectors = self.embedder.embed_batch(
+                texts,
+                "add",
+                usage_stage="add.fact_embedding",
+                usage_extra={"fact_count": len(texts)},
+            )
             embed_map = dict(zip(texts, vectors))
         except Exception:
             embed_map = {}
             for t in texts:
                 try:
-                    embed_map[t] = self.embedder.embed(t, "add")
+                    embed_map[t] = self.embedder.embed(
+                        t,
+                        "add",
+                        usage_stage="add.fact_embedding",
+                        usage_extra={"fact_count": 1, "fallback": True},
+                    )
                 except Exception as e:
                     logger.warning(f"Failed to embed fact text: {e}")
 
@@ -167,7 +177,11 @@ class MemoryWriter:
         metadata: Dict[str, Any],
     ) -> str:
         """Persist a single raw message string as a memory record."""
-        vec = self.embedder.embed(text, "add")
+        vec = self.embedder.embed(
+            text,
+            "add",
+            usage_stage="add.raw_embedding",
+        )
         memory_id = str(uuid.uuid4())
         now = datetime.now(timezone.utc).isoformat()
         payload = deepcopy(metadata) or {}
@@ -220,7 +234,11 @@ class MemoryWriter:
         if "attributed_to" not in new_payload and prev_payload.get("attributed_to"):
             new_payload["attributed_to"] = prev_payload["attributed_to"]
 
-        vec = self.embedder.embed(new_text, "update")
+        vec = self.embedder.embed(
+            new_text,
+            "update",
+            usage_stage="update.memory_embedding",
+        )
         self.vector_store.update(memory_id, vector=vec, payload=new_payload)
         self.memory_store.add_history(
             memory_id, prev_text, new_text, "UPDATE",

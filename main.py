@@ -20,6 +20,7 @@ The control flow inside ``add`` and ``search`` mirrors mem0 V3 (see
 from __future__ import annotations
 
 import logging
+import time
 from copy import deepcopy
 from typing import Any, Dict, List, Optional, Union
 
@@ -35,6 +36,7 @@ from litemem.storage.memory_store import MemoryStore, build_session_scope
 from litemem.storage.vector_store import VexDBVectorStore
 from litemem.utils.embeddings import OpenAIEmbedder
 from litemem.utils.llm_client import OpenAILLM
+from litemem.utils.text_utils import md5_hash
 from litemem.write_pipeline.deduplicator import Deduplicator
 from litemem.write_pipeline.entity_linker import EntityLinker
 from litemem.write_pipeline.memory_extractor import MemoryExtractor
@@ -131,6 +133,9 @@ class LiteMem:
         # --- I/O layers ---
         self.llm = OpenAILLM(self.config.llm)
         self.embedder = OpenAIEmbedder(self.config.embedder)
+        self.llm.usage_callback = self.config.usage_callback
+        self.embedder.usage_callback = self.config.usage_callback
+        self.technique_flags = self.config.technique_flags
         self.vector_store = VexDBVectorStore(self.config.vector_store)
         self.memory_store = MemoryStore(
             self.config.history_db_path,
@@ -157,6 +162,25 @@ class LiteMem:
         self._entity_retriever: Optional[EntityRetriever] = None
 
         self.rank_fusion = RankFusion()
+
+    def _emit_stage_event(self, stage: str, latency_s: float, **extra: Any) -> None:
+        callback = getattr(self.config, "usage_callback", None)
+        if callback is None:
+            return
+        event = {
+            "stage": stage,
+            "kind": "local",
+            "latency_s": latency_s,
+            "chat_input_tokens": 0,
+            "chat_output_tokens": 0,
+            "cached_tokens": 0,
+            "reasoning_tokens": 0,
+            "embedding_tokens": 0,
+            "total_tokens": 0,
+        }
+        if extra:
+            event["extra"] = extra
+        callback(event)
 
     # ------------------------------------------------------------------
     # Lazy entity infra
@@ -217,8 +241,8 @@ class LiteMem:
                 messages, metadata=processed_metadata, prompt=prompt
             )
 
-        # infer=False branch — store each message verbatim, no LLM.
-        if not infer:
+        # infer=False / ablated extraction branch — store each message verbatim, no LLM.
+        if not infer or not self.technique_flags.use_additive_extraction:
             results = []
             for msg in messages:
                 if not isinstance(msg, dict) or not msg.get("role") or not msg.get("content"):
@@ -244,25 +268,40 @@ class LiteMem:
 
         # === V3 phased batch pipeline ===
         session_scope = build_session_scope(effective_filters)
-        last_messages = self.memory_store.get_last_messages(
-            session_scope, limit=self.config.recent_messages_limit
-        )
+        if self.technique_flags.use_recent_messages_context:
+            last_messages = self.memory_store.get_last_messages(
+                session_scope, limit=self.config.recent_messages_limit
+            )
+        else:
+            last_messages = []
 
         session_only_filters = _session_filters(effective_filters)
         # Phase 1: existing memory retrieval (over the session-scope only).
-        query_text = "\n".join(
-            f"{m.get('role','')}: {m.get('content','')}" for m in messages
-        )
-        try:
-            query_vec = self.embedder.embed(query_text, "search")
-            existing_results = self.vector_store.search(
-                query_vec,
-                top_k=self.config.existing_memories_limit,
-                filters=session_only_filters,
+        existing_results = []
+        if self.technique_flags.use_existing_memory_context:
+            query_text = "\n".join(
+                f"{m.get('role','')}: {m.get('content','')}" for m in messages
             )
-        except Exception as e:
-            logger.warning(f"Existing-memory retrieval failed: {e}")
-            existing_results = []
+            try:
+                stage_start = time.perf_counter()
+                query_vec = self.embedder.embed(
+                    query_text,
+                    "search",
+                    usage_stage="add.existing_memory_lookup.embedding",
+                )
+                existing_results = self.vector_store.search(
+                    query_vec,
+                    top_k=self.config.existing_memories_limit,
+                    filters=session_only_filters,
+                )
+                self._emit_stage_event(
+                    "add.existing_memory_lookup.vector_search",
+                    time.perf_counter() - stage_start,
+                    result_count=len(existing_results),
+                )
+            except Exception as e:
+                logger.warning(f"Existing-memory retrieval failed: {e}")
+                existing_results = []
 
         # Phase 2: LLM extraction.
         extraction = self.extractor.extract(
@@ -271,12 +310,18 @@ class LiteMem:
             last_messages=last_messages,
             filters=effective_filters,
             prompt_override=prompt,
+            use_uuid_anonymization=self.technique_flags.use_uuid_anonymization,
+            use_json_response_format=self.technique_flags.use_json_response_format,
         )
 
         # Phases 4-5: hash dedup.
-        kept_facts, kept_hashes = self.deduplicator.filter(
-            extraction.facts, existing_hashes=extraction.existing_hashes
-        )
+        if self.technique_flags.use_hash_dedup:
+            kept_facts, kept_hashes = self.deduplicator.filter(
+                extraction.facts, existing_hashes=extraction.existing_hashes
+            )
+        else:
+            kept_facts = list(extraction.facts)
+            kept_hashes = [md5_hash(f.text) for f in kept_facts]
 
         # Phases 3 + 6 + 8: batch embed + persist + save messages.
         written = self.writer.write_facts(
@@ -288,7 +333,7 @@ class LiteMem:
         )
 
         # Phase 7: batch entity linking (best-effort, swallow failures).
-        if written:
+        if written and self.technique_flags.use_entity_boost:
             try:
                 self.entity_linker.link_memories(written, filters=effective_filters)
             except Exception as e:
@@ -339,17 +384,25 @@ class LiteMem:
         )
 
         # Step 4: keyword search via rank_bm25 over session corpus.
-        raw_bm25 = self.keyword_retriever.retrieve(
-            pre.lemmatized,
-            filters=session_only,
-            top_k=max(top_k * 4, 60),
-        )
+        raw_bm25 = []
+        if self.technique_flags.use_bm25:
+            stage_start = time.perf_counter()
+            raw_bm25 = self.keyword_retriever.retrieve(
+                pre.lemmatized,
+                filters=session_only,
+                top_k=max(top_k * 4, 60),
+            )
+            self._emit_stage_event(
+                "search.bm25",
+                time.perf_counter() - stage_start,
+                result_count=len(raw_bm25),
+            )
         # Step 5: BM25 sigmoid normalization.
         bm25_scores = normalize_bm25_scores(raw_bm25, query_num_terms=pre.num_terms)
 
         # Step 6: entity boost.
         entity_boosts: Dict[str, float] = {}
-        if pre.entities:
+        if pre.entities and self.technique_flags.use_entity_boost:
             try:
                 entity_boosts = self.entity_retriever.compute_boosts(
                     pre.entities, filters=session_only

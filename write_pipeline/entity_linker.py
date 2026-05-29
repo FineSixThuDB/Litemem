@@ -93,12 +93,24 @@ class EntityLinker:
 
         # 7b: Batch-embed all unique entities (with per-item fallback).
         try:
-            entity_vectors = self.embedder.embed_batch(entity_texts, "add")
+            entity_vectors = self.embedder.embed_batch(
+                entity_texts,
+                "add",
+                usage_stage="add.entity_linking.embedding",
+                usage_extra={"entity_count": len(entity_texts)},
+            )
         except Exception:
             entity_vectors = []
             for t in entity_texts:
                 try:
-                    entity_vectors.append(self.embedder.embed(t, "add"))
+                    entity_vectors.append(
+                        self.embedder.embed(
+                            t,
+                            "add",
+                            usage_stage="add.entity_linking.embedding",
+                            usage_extra={"entity_count": 1, "fallback": True},
+                        )
+                    )
                 except Exception:
                     entity_vectors.append(None)
 
@@ -210,7 +222,11 @@ class EntityLinker:
                     if not isinstance(entity_text, str) or not entity_text:
                         continue
                     try:
-                        vec = self.embedder.embed(entity_text, "update")
+                        vec = self.embedder.embed(
+                            entity_text,
+                            "update",
+                            usage_stage="update.entity_embedding",
+                        )
                     except Exception as e:
                         logger.debug(f"Entity re-embed failed for '{entity_text}': {e}")
                         continue
@@ -231,7 +247,11 @@ class EntityLinker:
         session_filters: Dict[str, Any],
     ) -> None:
         try:
-            vec = self.embedder.embed(entity_text, "add")
+            vec = self.embedder.embed(
+                entity_text,
+                "add",
+                usage_stage="add.entity_linking.embedding",
+            )
         except Exception as e:
             logger.debug(f"Entity embed failed for '{entity_text}': {e}")
             return

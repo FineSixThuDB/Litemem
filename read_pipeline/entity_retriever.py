@@ -68,7 +68,12 @@ class EntityRetriever:
         memory_boosts: Dict[str, float] = {}
         for _, entity_text in deduped:
             try:
-                vec = self.embedder.embed(entity_text, "search")
+                vec = self.embedder.embed(
+                    entity_text,
+                    "search",
+                    usage_stage="search.entity_embedding",
+                    usage_extra={"entity_text": entity_text},
+                )
                 matches = self.entity_store.search(
                     vec, top_k=500, filters=session_filters
                 )

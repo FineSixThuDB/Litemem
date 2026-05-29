@@ -15,6 +15,7 @@ from __future__ import annotations
 
 import logging
 import os
+import time
 from typing import Any, Dict, List, Optional
 
 from litemem.config import LLMConfig
@@ -42,6 +43,7 @@ class OpenAILLM:
             ) from e
 
         self.config = config or LLMConfig()
+        self.usage_callback = None
         api_key = resolve_openai_api_key(self.config.api_key)
         base_url = (
             self.config.base_url
@@ -50,6 +52,68 @@ class OpenAILLM:
             or "https://api.openai.com/v1"
         )
         self.client = OpenAI(api_key=api_key, base_url=base_url, timeout=self.config.timeout)
+
+    @staticmethod
+    def _usage_get(obj: Any, key: str, default: Any = None) -> Any:
+        if obj is None:
+            return default
+        if isinstance(obj, dict):
+            return obj.get(key, default)
+        return getattr(obj, key, default)
+
+    @classmethod
+    def _extract_usage(cls, usage: Any) -> Dict[str, Any]:
+        prompt_details = cls._usage_get(usage, "prompt_tokens_details", {}) or {}
+        completion_details = cls._usage_get(usage, "completion_tokens_details", {}) or {}
+        input_details = cls._usage_get(usage, "input_tokens_details", {}) or {}
+        output_details = cls._usage_get(usage, "output_tokens_details", {}) or {}
+        prompt_tokens = cls._usage_get(
+            usage, "prompt_tokens", cls._usage_get(usage, "input_tokens", 0)
+        ) or 0
+        completion_tokens = cls._usage_get(
+            usage, "completion_tokens", cls._usage_get(usage, "output_tokens", 0)
+        ) or 0
+        cached_tokens = (
+            cls._usage_get(prompt_details, "cached_tokens", None)
+            if prompt_details
+            else cls._usage_get(input_details, "cached_tokens", None)
+        )
+        reasoning_tokens = (
+            cls._usage_get(completion_details, "reasoning_tokens", None)
+            if completion_details
+            else cls._usage_get(output_details, "reasoning_tokens", None)
+        )
+        total_tokens = cls._usage_get(usage, "total_tokens", prompt_tokens + completion_tokens) or 0
+        return {
+            "chat_input_tokens": int(prompt_tokens or 0),
+            "chat_output_tokens": int(completion_tokens or 0),
+            "cached_tokens": int(cached_tokens or 0),
+            "reasoning_tokens": int(reasoning_tokens or 0),
+            "total_tokens": int(total_tokens or 0),
+            "usage_missing": usage is None,
+        }
+
+    def _emit_usage(
+        self,
+        *,
+        stage: Optional[str],
+        usage: Any,
+        latency_s: float,
+        extra: Optional[Dict[str, Any]] = None,
+    ) -> None:
+        if self.usage_callback is None:
+            return
+        event = {
+            "stage": stage or "chat.completion",
+            "kind": "chat",
+            "model": self.config.model,
+            "latency_s": latency_s,
+            "embedding_tokens": 0,
+            **self._extract_usage(usage),
+        }
+        if extra:
+            event["extra"] = extra
+        self.usage_callback(event)
 
     # ------------------------------------------------------------------
     # Helpers
@@ -96,6 +160,8 @@ class OpenAILLM:
         self,
         messages: List[Dict[str, str]],
         response_format: Optional[Dict[str, Any]] = None,
+        usage_stage: Optional[str] = None,
+        usage_extra: Optional[Dict[str, Any]] = None,
         **kwargs,
     ) -> str:
         """Return the assistant's reply text.
@@ -105,6 +171,7 @@ class OpenAILLM:
             response_format: e.g. ``{"type": "json_object"}`` to force JSON.
         """
         params = self._build_params(messages, response_format, **kwargs)
+        start = time.perf_counter()
         try:
             response = self.client.chat.completions.create(**params)
         except Exception as e:
@@ -116,4 +183,11 @@ class OpenAILLM:
                 response = self.client.chat.completions.create(**params)
             else:
                 raise
+        latency_s = time.perf_counter() - start
+        self._emit_usage(
+            stage=usage_stage,
+            usage=getattr(response, "usage", None),
+            latency_s=latency_s,
+            extra=usage_extra,
+        )
         return response.choices[0].message.content or ""
